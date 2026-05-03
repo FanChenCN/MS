@@ -1,0 +1,8 @@
+dataset:
+  eval_test:
+  - name: kitti_depth
+    disp_name: kitti_eigen_test_filtered
+    dir: preparedAll/kitti
+    filenames: data_split/kitti_depth/eigen_test_files_with_gt_filtered.txt
+    kitti_bm_crop: true
+    valid_mask_crop: eigen

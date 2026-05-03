@@ -1,0 +1,225 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                    Slot Attention 集成快速参考卡片                            ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 📋 你的4个顾虑 - 快速回答                                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+1️⃣  SD 在哪里初始化？
+   📍 位置: script/depth/train.py:344
+   💡 方法: MarigoldDepthPipeline.from_pretrained('stable-diffusion-2')
+   ✅ Slot 模块在 Pipeline.__init__() 中初始化，随机权重
+
+2️⃣  Slot 如何初始化？
+   📁 文件: src/model/slot_attention.py (已创建 ✅)
+   🔧 组件: SlotInitializer + SlotAttention + SlotAggregator
+   💡 参考: VQ-VFM-OCL 项目的 ocl.py
+
+3️⃣  融入 Slot 会报错吗？
+   ❌ 不会！解决方案: Pad slots 到 (B, 77, 768) 匹配 text_embed
+   ✅ 加载权重时: Slot 是新模块，会被忽略（不报错）
+   ✅ Forward 时: Padding 后维度完全一致
+
+4️⃣  会破坏 SD 先验吗？
+   ⚠️  有风险，但有5层防护:
+   ✅ 渐进式训练 (500 iter 只训练 Slot → 1000 iter 小 LR → 正常训练)
+   ✅ 正则化损失 (保持 slots 分布与 text_embed 相似)
+   ✅ 梯度裁剪 (max_norm=1.0)
+   ✅ no_grad 提取特征 (避免影响 VAE)
+   ✅ EMA 权重 (可选，防止崩溃)
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 📂 已创建的文件                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+✅ src/model/slot_attention.py          - Slot 模块实现 (核心代码)
+✅ config/slot_config.yaml              - Slot 配置文件
+✅ INTEGRATION_GUIDE.py                 - Pipeline 修改指南 (详细注释)
+✅ TRAINER_GUIDE.py                     - Trainer 修改指南 (详细注释)
+✅ README_SLOT_INTEGRATION.md           - 完整集成文档 (必读!)
+✅ QUICK_REFERENCE.txt                  - 本文件
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 📝 需要手动修改的3个文件                                                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+1. marigold/marigold_depth_pipeline.py
+   参考: INTEGRATION_GUIDE.py
+   修改:
+   - Import SlotAggregator
+   - __init__() 添加 slot 参数和初始化
+   - 添加 aggregate_slots() 方法
+   - 修改 single_infer() 使用 slots
+
+2. src/trainer/marigold_depth_trainer.py
+   参考: TRAINER_GUIDE.py
+   修改:
+   - __init__() 设置 slot 可训练，添加到 optimizer
+   - 添加 compute_slot_regularization() 方法
+   - 添加 adjust_training_stage() 方法
+   - 修改 train_step() 集成 slot 训练逻辑
+
+3. config/train_marigold_depth.yaml
+   添加:
+   base_config:
+   - config/slot_config.yaml
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 🔧 核心代码片段                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+【Pipeline 中的 Slot 聚合】
+```python
+def aggregate_slots(self, rgb_latent):
+    # 1. 提取特征 (no_grad 避免影响 VAE)
+    with torch.no_grad():
+        feat = self.unet.conv_in(rgb_latent)  # (B, 320, H, W)
+
+    # 2. 聚合 slots
+    slots, attn = self.slot_aggregator(feat)  # (B, 7, 768)
+
+    # 3. Pad 到 77 匹配 text_embed
+    padding = torch.zeros(B, 77 - 7, 768, device=slots.device)
+    slots_padded = torch.cat([slots, padding], dim=1)  # (B, 77, 768)
+
+    return slots_padded, attn
+```
+
+【Trainer 中的渐进式训练】
+```python
+def adjust_training_stage(self):
+    # 阶段 1: 只训练 Slot
+    if self.effective_iter < 500:
+        self.model.unet.requires_grad_(False)
+        self.model.slot_aggregator.requires_grad_(True)
+
+    # 阶段 2: 小 LR 训练 UNet
+    elif self.effective_iter < 1000:
+        self.model.unet.requires_grad_(True)
+        for pg in self.optimizer.param_groups:
+            if pg['name'] == 'unet':
+                pg['lr'] = self.cfg.lr * 0.1
+
+    # 阶段 3: 正常训练
+    else:
+        for pg in self.optimizer.param_groups:
+            if pg['name'] == 'unet':
+                pg['lr'] = self.cfg.lr
+```
+
+【正则化损失】
+```python
+def compute_slot_regularization(self, slots, text_embed):
+    mean_loss = F.mse_loss(slots.mean(1), text_embed.mean(1))
+    std_loss = F.mse_loss(slots.std(1), text_embed.std(1))
+    return mean_loss + std_loss
+
+# 在 train_step 中
+total_loss = depth_loss + 0.01 * slot_reg_loss
+```
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 🧪 测试步骤                                                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+1. 测试 Slot 模块
+   python -c "from src.model.slot_attention import SlotAggregator; print('✅ Import OK')"
+
+2. 测试 Pipeline 加载
+   python -c "from marigold import MarigoldDepthPipeline; \
+              m = MarigoldDepthPipeline.from_pretrained('stabilityai/stable-diffusion-2', \
+              use_slot_attention=True); print('✅ Load OK')"
+
+3. 小规模训练测试
+   python script/depth/train.py \
+       --config config/train_debug_depth.yaml \
+       --exit_after 5
+
+4. 检查日志
+   - 是否有 "Slot Aggregator is trainable"
+   - 是否有 "[Stage 1/2/3]" 训练阶段切换
+   - 是否有 "slot_reg_loss" 记录
+   - Loss 是否正常下降（无 NaN）
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ ⚙️ 关键参数配置                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+num_slots: 7                    # 对象槽数量 (典型: 5-10)
+slot_dim: 768                   # 必须匹配 text_embed (SD v2 = 768)
+num_iter: 3                     # Slot attention 迭代次数 (典型: 3-5)
+input_dim: 320                  # UNet conv_in 输出维度 (SD v2 = 320)
+
+warmup_slot_only_iters: 500    # 阶段1: 只训练 Slot
+warmup_small_lr_iters: 1000    # 阶段2: 小 LR 训练
+unet_lr_ratio: 0.1             # 阶段2 的 UNet LR 比例
+
+slot_reg_weight: 0.01          # 正则化损失权重
+slot_grad_clip: 1.0            # 梯度裁剪阈值
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 🐛 常见问题速查                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+❌ "Unexpected key(s): slot_aggregator..."
+   ✅ 正常！Slot 是新模块，预训练权重中没有，可忽略
+
+❌ Loss 变成 NaN
+   ✅ 检查: 渐进式训练、梯度裁剪、学习率、depth_transform.py 修复
+
+❌ Slot attention 输出全相同
+   ✅ 增大 slots_log_sigma、增加 num_iter、检查输入特征
+
+❌ 训练速度变慢
+   ✅ 减少 num_iter (3→2)、减少 num_slots (7→5)
+
+❌ 不知道 Slot 是否工作
+   ✅ 可视化 attention maps (参考 README 测试方法4)
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 📚 推荐阅读顺序                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+1. 本文件 (QUICK_REFERENCE.txt)           - 快速了解全貌
+2. README_SLOT_INTEGRATION.md             - 详细理解原理和方案
+3. INTEGRATION_GUIDE.py                   - 修改 Pipeline 时参考
+4. TRAINER_GUIDE.py                       - 修改 Trainer 时参考
+5. src/model/slot_attention.py            - 理解 Slot 实现细节
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 🎯 下一步行动                                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+□ 1. 阅读 README_SLOT_INTEGRATION.md 理解完整方案
+□ 2. 按照 INTEGRATION_GUIDE.py 修改 marigold_depth_pipeline.py
+□ 3. 按照 TRAINER_GUIDE.py 修改 marigold_depth_trainer.py
+□ 4. 修改 config/train_marigold_depth.yaml 添加 slot 配置
+□ 5. 运行测试步骤 1-4 验证集成
+□ 6. 小规模训练 (100 iter) 验证稳定性
+□ 7. 可视化 Slot Attention 验证效果
+□ 8. 完整训练 (5000 iter)
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 💡 核心思想总结                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+原始 Marigold:  RGB → VAE → UNet(latent, text_embed) → Depth
+集成 Slot 后:   RGB → VAE → UNet(latent, slots) → Depth
+                              ↑
+                        Slot Attention 聚合对象特征
+
+关键创新:
+- 用 Slot Attention 替代 empty text embedding
+- Slots 捕获场景中的对象级信息
+- 渐进式训练保护 SD 先验
+- 正则化确保 slots 分布合理
+
+预期效果:
+- 更好的深度估计（特别是对象边界）
+- 可解释性（通过 attention maps）
+- 对象级别的场景理解
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  祝你集成顺利！有问题随时查阅 README_SLOT_INTEGRATION.md 📖                  ║
+╚══════════════════════════════════════════════════════════════════════════════╝

@@ -1,0 +1,38 @@
+# Slot Attention Configuration for Marigold
+
+slot_attention:
+  # Enable/disable slot attention
+  use_slot_attention: true
+
+  # Slot parameters
+  num_slots: 7  # Number of object slots (typical: 5-10)
+  slot_dim: 768  # Must match text_embed dimension (SD v2 uses 768)
+
+  # Slot attention parameters
+  num_iter: 3  # Number of slot attention iterations (typical: 3-5)
+  ffn_dim: 2048  # Hidden dimension of FFN (typically 2-4x slot_dim)
+  dropout: 0.0  # Dropout rate in FFN
+
+  # Input feature dimension from UNet conv_in
+  input_dim: 320  # SD v2 UNet conv_in output channels
+
+  # Training strategy
+  training:
+    # Warmup stages to prevent breaking SD prior
+    warmup_slot_only_iters: 500  # Stage 1: Train only slot modules
+    warmup_small_lr_iters: 1000  # Stage 2: Train with small LR
+    unet_lr_ratio: 0.1  # UNet LR ratio during stage 2
+
+    # Regularization
+    use_slot_regularization: true
+    slot_reg_weight: 0.01  # Weight for slot distribution regularization
+
+    # Gradient clipping
+    slot_grad_clip: 1.0
+
+  # Slot output format
+  output:
+    # How to format slots for UNet cross-attention
+    # Options: "pad", "repeat", "project"
+    format_method: "pad"
+    target_length: 77  # SD v2 text embedding length
