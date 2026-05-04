@@ -271,6 +271,8 @@ class SlotAggregator(nn.Module):
             B, C, H, W = feat.shape
             feat = feat.flatten(2).permute(0, 2, 1)  # (B, H*W, C)
 
+        # Fourier transform input features
+        feat = self._fourier_forground_enhance(feat)
         # Initialize slots
         queries = self.slot_init(feat)  # (B, num_slots, slot_dim)
 
@@ -279,6 +281,47 @@ class SlotAggregator(nn.Module):
 
         return slots, attn
 
+    def _fourier_forground_enhance(self,feat):
+        """
+        feat:[B,H*W,C] c=512 or c=516 对vae_mid 做低通滤波，计算前景分数，对token加权
+        return:[B,H*W,C]
+        """
+        vae_feat = feat[...,:512]
+        # 沿着channel维度做FFT 快速傅里叶变换 
+        # 目的：将特征从空间域转换到频域
+        f = torch.fft.fft(vae_feat,dim=-1)
+        
+        # 高斯低通核,只构建一次
+        if not hasattr(self,'_gaussian_kernel'):
+            sigma = 512 ** 0.5
+            k = torch.arange(512,device=feat.device).float()-256
+            kernel = torch.exp(-0.5*(k/sigma)**2)
+            kernel = kernel/kernel.max()
+            self._gaussian_kernel = kernel # (512,)
+        
+        gauss = self._gaussian_kernel.to(feat.device)
+        # 将零频分量移到频谱中心
+        # FFT默认零频在开头，fftshift将其移到中间
+        # 便于与中心对称的高斯核相乘
+        f_shift = torch.fft.fftshift(f,dim=-1)
+        # 频域乘法 = 时域卷积
+        # 高斯核在频域做低通滤波，保留低频，衰减高频
+        # 结果仍为复数，需要取实部转换回空间域
+        f_smooth = f_shift*gauss
+        f_smooth = torch.fft.ifftshift(f_smooth,dim=-1) # 将零频分量移回开头
+        smooth = torch.fft.ifft(f_smooth,dim=-1).real # 傅里叶逆变化取实部
+
+        # 前景分数：每个空间位置的得分 (对channel维度取均值)
+        residual = torch.abs(vae_feat-smooth)+1e-6
+        score = vae_feat.abs()/residual # (B,H*W,512)
+        score = score.mean(dim=-1,keepdim=True) # (B,H*W,1)
+        score = torch.sigmoid(score) # 归一化到[0,1]
+
+        # 使用分数对feat加权（前景token贡献更大）
+        feat = feat * score
+        return feat
+
+            
     @property
     def dtype(self):
         """

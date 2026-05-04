@@ -743,42 +743,38 @@ class MarigoldDepthTrainer:
         return
 
     def _log_slots_wandb(self, rgb, attn, latent_h, latent_w):
-        """Log original RGB and slots attention map (black background) to wandb."""
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
+      import matplotlib
+      matplotlib.use("Agg")
+      import matplotlib.pyplot as plt
 
-        # Use first image in batch
-        img = rgb[0]  # (3, H, W)
-        H, W = img.shape[1], img.shape[2]
-        img_np = ((img.permute(1, 2, 0).numpy() + 1) / 2).clip(0, 1)  # (H, W, 3)
+      img = rgb[0]
+      H, W = img.shape[1], img.shape[2]
+      img_np = ((img.permute(1, 2, 0).numpy() + 1) / 2).clip(0, 1)
 
-        num_slots = attn.shape[1]
-        attn_hw = attn[0]  # (num_slots, H*W)
+      num_slots = attn.shape[1]
+      attn_hw = attn[0].reshape(num_slots, latent_h, latent_w).numpy()
 
-        # Use actual latent spatial dimensions (non-square support)
-        attn_hw = attn_hw.reshape(num_slots, latent_h, latent_w).numpy()
+      cols = 4
+      rows = (num_slots + 1 + cols - 1) // cols
+      fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
+      axes = axes.flatten()
 
-        colors = plt.cm.get_cmap("tab20", num_slots)
+      axes[0].imshow(img_np)
+      axes[0].set_title("RGB")
+      axes[0].axis("off")
 
-        # Slots attention on black background
-        slot_map = np.zeros((H, W, 3), dtype=np.float32)
-        for s in range(num_slots):
-            a = attn_hw[s]  # (lh, lw)
-            a = np.array(Image.fromarray(a).resize((W, H), Image.BILINEAR))
-            a = (a - a.min()) / (a.max() - a.min() + 1e-6)
-            color = np.array(colors(s)[:3])
-            slot_map += a[:, :, None] * color
+      for s in range(num_slots):
+          a = np.array(Image.fromarray(attn_hw[s]).resize((W, H), Image.BILINEAR))
+          axes[s + 1].imshow(img_np)
+          axes[s + 1].imshow(a, alpha=0.6, cmap="hot")
+          axes[s + 1].set_title(f"slot {s}")
+          axes[s + 1].axis("off")
 
-        slot_map = slot_map.clip(0, 1)
+      for i in range(num_slots + 1, len(axes)):
+          axes[i].axis("off")
 
-        wandb.log(
-            {
-                "train/rgb": wandb.Image((img_np * 255).astype(np.uint8)),
-                "train/slots_attn": wandb.Image((slot_map * 255).astype(np.uint8)),
-            },
-            step=self.effective_iter,
-        )
-
+      fig.tight_layout()
+      wandb.log({"train/slots_grid": wandb.Image(fig)}, step=self.effective_iter)
+      plt.close(fig)
     def _get_backup_ckpt_name(self):
         return f"iter_{self.effective_iter:06d}"

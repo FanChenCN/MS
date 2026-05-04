@@ -13,7 +13,7 @@ pipeline:
     shift_invariant: true
     default_denoising_steps: 4
     default_processing_resolution: 768
-    num_slots: 16
+    num_slots: 8
     slot_iter: 3
     slot_dim: 1024
     slot_ffn_dim: 2048
@@ -43,7 +43,7 @@ trainer:
   save_period: 50
   backup_period: 1000  # adjusted from 2000
   validation_period: 250  # adjusted from 500 for more frequent checks
-  visualization_period: 500  # adjusted from 1000
+  visualization_period: 100  # adjusted from 1000
 
 multi_res_noise:
   strength: 0.9
