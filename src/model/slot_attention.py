@@ -320,8 +320,7 @@ class SlotAggregator(nn.Module):
         # 使用分数对feat加权（前景token贡献更大）
         feat = feat * score
         return feat
-
-            
+         
     @property
     def dtype(self):
         """
