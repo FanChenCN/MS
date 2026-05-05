@@ -743,38 +743,43 @@ class MarigoldDepthTrainer:
         return
 
     def _log_slots_wandb(self, rgb, attn, latent_h, latent_w):
-      import matplotlib
-      matplotlib.use("Agg")
-      import matplotlib.pyplot as plt
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
 
-      img = rgb[0]
-      H, W = img.shape[1], img.shape[2]
-      img_np = ((img.permute(1, 2, 0).numpy() + 1) / 2).clip(0, 1)
+        img = rgb[0]
+        H, W = img.shape[1], img.shape[2]
+        img_np = ((img.permute(1, 2, 0).cpu().numpy() + 1) / 2).clip(0, 1)
+        img_u8 = (img_np * 255).astype(np.uint8)
 
-      num_slots = attn.shape[1]
-      attn_hw = attn[0].reshape(num_slots, latent_h, latent_w).numpy()
+        num_slots = attn.shape[1]
+        # attn: (B, num_slots, H*W), softmax over slots → each pixel sums to 1
+        attn_hw = attn[0].reshape(num_slots, latent_h, latent_w).cpu().numpy()
 
-      cols = 4
-      rows = (num_slots + 1 + cols - 1) // cols
-      fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
-      axes = axes.flatten()
+        # --- argmax segmentation map (VQ-style) ---
+        # resize each slot map to image resolution, then argmax
+        attn_full = np.stack([
+            np.array(Image.fromarray(attn_hw[s]).resize((W, H), Image.BILINEAR))
+            for s in range(num_slots)
+        ])  # (num_slots, H, W)
+        seg_idx = attn_full.argmax(axis=0)  # (H, W) each pixel → slot id
 
-      axes[0].imshow(img_np)
-      axes[0].set_title("RGB")
-      axes[0].axis("off")
+        np.random.seed(42)
+        colors = np.random.randint(60, 230, size=(num_slots, 3), dtype=np.uint8)
+        colors[0] = [40, 40, 40]  # slot 0 = dark (background)
 
-      for s in range(num_slots):
-          a = np.array(Image.fromarray(attn_hw[s]).resize((W, H), Image.BILINEAR))
-          axes[s + 1].imshow(img_np)
-          axes[s + 1].imshow(a, alpha=0.6, cmap="hot")
-          axes[s + 1].set_title(f"slot {s}")
-          axes[s + 1].axis("off")
+        seg_color = colors[seg_idx]  # (H, W, 3)
 
-      for i in range(num_slots + 1, len(axes)):
-          axes[i].axis("off")
+        # blend seg_color onto RGB
+        overlay = (img_u8 * 0.5 + seg_color * 0.5).astype(np.uint8)
 
-      fig.tight_layout()
-      wandb.log({"train/slots_grid": wandb.Image(fig)}, step=self.effective_iter)
-      plt.close(fig)
+        fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+        axes[0].imshow(img_np);          axes[0].set_title("RGB");          axes[0].axis("off")
+        axes[1].imshow(seg_color);       axes[1].set_title("Slot seg");     axes[1].axis("off")
+        axes[2].imshow(overlay);         axes[2].set_title("Overlay");      axes[2].axis("off")
+
+        fig.tight_layout()
+        wandb.log({"train/slots_grid": wandb.Image(fig)}, step=self.effective_iter)
+        plt.close(fig)
     def _get_backup_ckpt_name(self):
         return f"iter_{self.effective_iter:06d}"
