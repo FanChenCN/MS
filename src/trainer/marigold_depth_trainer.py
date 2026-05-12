@@ -773,10 +773,27 @@ class MarigoldDepthTrainer:
         # blend seg_color onto RGB
         overlay = (img_u8 * 0.5 + seg_color * 0.5).astype(np.uint8)
 
-        fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-        axes[0].imshow(img_np);          axes[0].set_title("RGB");          axes[0].axis("off")
-        axes[1].imshow(seg_color);       axes[1].set_title("Slot seg");     axes[1].axis("off")
-        axes[2].imshow(overlay);         axes[2].set_title("Overlay");      axes[2].axis("off")
+        cols = max(3, num_slots)
+        fig, axes = plt.subplots(2, cols, figsize=(cols * 3, 8))
+
+        axes[0, 0].imshow(img_np);    axes[0, 0].set_title("RGB");       axes[0, 0].axis("off")
+        axes[0, 1].imshow(seg_color); axes[0, 1].set_title("Slot seg");  axes[0, 1].axis("off")
+        axes[0, 2].imshow(overlay);   axes[0, 2].set_title("Overlay");   axes[0, 2].axis("off")
+        for i in range(3, cols):
+            axes[0, i].axis("off")
+
+        # Row 2: per-slot binary mask applied to RGB
+        for s in range(num_slots):
+            mask = (seg_idx == s)  # (H, W) bool
+            masked = img_u8.copy()
+            masked[~mask] = 0
+            ax = axes[1, s] if s < cols else None
+            if ax is not None:
+                ax.imshow(masked)
+                ax.set_title(f"slot {s}")
+                ax.axis("off")
+        for i in range(num_slots, cols):
+            axes[1, i].axis("off")
 
         fig.tight_layout()
         wandb.log({"train/slots_grid": wandb.Image(fig)}, step=self.effective_iter)
