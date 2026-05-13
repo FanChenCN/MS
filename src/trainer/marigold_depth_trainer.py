@@ -96,19 +96,35 @@ class MarigoldDepthTrainer:
 
         self.model.unet.enable_xformers_memory_efficient_attention()
 
-        # Trainability
+        # trainability
         self.model.vae.requires_grad_(False)
         self.model.text_encoder.requires_grad_(False)
-        self.model.unet.requires_grad_(True)
+
+        # Cross-attention only training like conda
+        self.training_unet_cross_attention = self.cfg.pipeline.kwargs.get("training_unet_cross_attention",False)
+        trainable_keys = self.cfg.pipeline.kwargs.get("trainable_keys",None)
+        if self.training_unet_cross_attention and trainable_keys is not None:
+            self.model.unet.requires_grad_(False)
+            self.model.unet.eval()
+            enabled_count = 0
+            for name,param in self.model.unet.named_parameters():
+                for key in trainable_keys:
+                    if key in name:
+                        param.requires_grad_(True)
+                        enabled_count +=1
+                        break
+            logging.info(f"Cross-attention only:enabled grad for {enabled_count} Unet Parameters")
+        else:
+            self.model.unet.requires_grad_(True)
+        
         self.model.aggregator.requires_grad_(True)
 
-        # Optimizer !should be defined after input layer is adapted
+        # Optimizer! should be defined after input layer is adapted
         lr = self.cfg.lr
-        self.optimizer = Adam(
-            list(self.model.unet.parameters()) + list(self.model.aggregator.parameters()),
-            lr=lr
-        )
-
+        unet_trainable = [p for p in self.model.unet.parameters() if p.requires_grad]
+        self.optimizer = Adam(unet_trainable + list(self.model.aggregator.parameters()),
+                              lr=lr)
+        
         # LR scheduler
         lr_func = IterExponential(
             total_iter_length=self.cfg.lr_scheduler.kwargs.total_iter,
@@ -231,7 +247,10 @@ class MarigoldDepthTrainer:
 
             # Skip previous batches when resume
             for batch in skip_first_batches(self.train_loader, self.n_batch_in_epoch):
-                self.model.unet.train()
+                if self.training_unet_cross_attention:
+                    self.model.unet.eval()
+                else:
+                    self.model.unet.train()
 
                 # globally consistent random generators
                 if self.seed is not None:

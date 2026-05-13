@@ -42,10 +42,10 @@ trainer:
   training_noise_scheduler:
   pretrained_path: stable-diffusion-2
   init_seed: 2024  # use null to train w/o seeding
-  save_period: 250
+  save_period: 500
   backup_period: 1000  # adjusted from 2000
-  validation_period: 100  # adjusted from 500 for more frequent checks
-  visualization_period: 100  # adjusted from 1000
+  validation_period: 1000  # adjusted from 500 for more frequent checks
+  visualization_period: 1000  # adjusted from 1000
 
 multi_res_noise:
   strength: 0.9
@@ -56,7 +56,7 @@ gt_depth_type: depth_raw_norm
 gt_mask_type: valid_mask_raw
 
 max_epoch: 10000  # a large enough number
-max_iter: 500  # adjusted for smaller dataset (2.5K Hypersim + 20K vKITTI)
+max_iter: 5000  # adjusted for smaller dataset (2.5K Hypersim + 20K vKITTI)
 
 optimizer:
   name: Adam
@@ -72,7 +72,7 @@ lr_scheduler:
   kwargs:
     total_iter: 4500  # adjusted for max_iter=5000
     final_ratio: 0.01
-    warmup_steps: 100
+    warmup_steps: 300
 
 # Light setting for the in-training validation and visualization
 validation:
