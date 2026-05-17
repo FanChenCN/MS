@@ -37,6 +37,7 @@ import numpy as np
 import torch
 from PIL import Image
 from src.model.slot_attention import SlotAggregator
+from src.model.broadcast_decoder import BroadcastDecoder
 from diffusers import (
     AutoencoderKL,
     DDIMScheduler,
@@ -121,7 +122,7 @@ class MarigoldDepthPipeline(DiffusionPipeline):
     """
 
     latent_scale_factor = 0.18215
-    _optional_components = ["aggregator"]
+    _optional_components = ["aggregator","dino_encoder","broadcast_decoder"]
 
     def __init__(
         self,
@@ -139,10 +140,28 @@ class MarigoldDepthPipeline(DiffusionPipeline):
         slot_iter: Optional[int] = 3,
         slot_dim: Optional[int] = 768,
         slot_ffn_dim: Optional[int] = 2048,
-        slot_input_dim: Optional[int] = 516,  # 512 (VAE mid) + 4 (rgb_latent)
+        slot_input_dim: Optional[int] = 384,  # 384 dino + 4 (rgb_latent)
+        dino_encoder: Optional[nn.Module] = None,
+        dino_model_name: Optional[str] = "vit_small_patch14_reg4_dinov2.lvd142m",
+        dino_in_size: Optional[int] = 518,
+        broadcast_decoder:Optional[BroadcastDecoder]=None,
     ):
         super().__init__()
-
+        # 添加Dino解码器
+        if dino_encoder is None:
+            from src.model.dino_encoder import DINO2ViT
+            dino_encoder = DINO2ViT(
+                model_name = dino_model_name,
+                in_size = dino_in_size,
+                rearrange_out = True,
+                norm_out = True,
+            )
+        if broadcast_decoder is None:
+            broadcast_decoder = BroadcastDecoder(
+                slot_dim = slot_dim,
+                dino_dim = 384,
+                hidden_dims=[2048,2048,2048],
+            )
         # 初始化 SlotAggregator（如果没有提供）
         if aggregator is None:
             aggregator = SlotAggregator(
@@ -154,12 +173,14 @@ class MarigoldDepthPipeline(DiffusionPipeline):
                 dropout=0.0,
             )
         self.register_modules(
+            dino_encoder=dino_encoder,
             unet=unet,
             vae=vae,
             scheduler=scheduler,
             text_encoder=text_encoder,
             tokenizer=tokenizer,
             aggregator=aggregator,
+            broadcast_decoder=broadcast_decoder,
         )
 
         # VAE encoder hook for extracting intermediate features (must be after register_modules)
@@ -176,6 +197,8 @@ class MarigoldDepthPipeline(DiffusionPipeline):
             slot_dim=slot_dim,
             slot_ffn_dim=slot_ffn_dim,
             slot_input_dim=slot_input_dim,
+            dino_model_name=dino_model_name,
+            dino_in_size=dino_in_size,
         )
 
         self.scale_invariant = scale_invariant
@@ -468,14 +491,12 @@ class MarigoldDepthPipeline(DiffusionPipeline):
         # Encode image
         rgb_latent = self.encode_rgb(rgb_in)  # [B, 4, h, w]
 
-        # Extract VAE intermediate features (stored by hook)
-        vae_mid_feat = self.vae_mid_features  # [B, 512, h, w]
-
-        # Concatenate VAE mid features with rgb_latent for slot aggregation
-        slot_input = torch.cat([vae_mid_feat, rgb_latent], dim=1)  # [B, 516, h, w]
+        # Dino 进行特征提取给slots输入
+        with torch.no_grad():
+            dino_feat,dino_valid_mask = self.dino_encoder(rgb_in) # [B,384,h_d,w_d]  # [B, 384, h, w]
 
         # Aggregate slots from concatenated features
-        slots, attn = self.aggregator(slot_input)  # [B, num_slots, slot_dim]
+        slots, attn = self.aggregator(dino_feat,valid_mask = dino_valid_mask)  # [B, num_slots, slot_dim]
 
         # Pad slots to match text embedding length (77)
         B, num_slots, slot_dim = slots.shape
@@ -575,4 +596,3 @@ class MarigoldDepthPipeline(DiffusionPipeline):
         # mean of output channels
         depth_mean = stacked.mean(dim=1, keepdim=True)
         return depth_mean
-

@@ -13,11 +13,14 @@ pipeline:
     shift_invariant: true
     default_denoising_steps: 4
     default_processing_resolution: 768
-    num_slots: 16
+    num_slots: 8
     slot_iter: 3
     slot_dim: 1024
     slot_ffn_dim: 2048
-    slot_input_dim: 516  # 512 (VAE mid features) + 4 (rgb_latent)
+    slot_input_dim: 384  # 512 (VAE mid features) + 4 (rgb_latent)
+    
+recon_warmup_steps: 0
+lambda_recon: 0.1
 
 depth_normalization:
   type: scale_shift_depth
@@ -40,9 +43,9 @@ trainer:
   training_noise_scheduler:
   pretrained_path: stable-diffusion-2
   init_seed: 2024  # use null to train w/o seeding
-  save_period: 50
+  save_period: 1000
   backup_period: 1000  # adjusted from 2000
-  validation_period: 250  # adjusted from 500 for more frequent checks
+  validation_period: 500  # adjusted from 500 for more frequent checks
   visualization_period: 500  # adjusted from 1000
 
 multi_res_noise:
@@ -54,7 +57,7 @@ gt_depth_type: depth_raw_norm
 gt_mask_type: valid_mask_raw
 
 max_epoch: 10000  # a large enough number
-max_iter: 500  # adjusted for smaller dataset (2.5K Hypersim + 20K vKITTI)
+max_iter: 5000  # adjusted for smaller dataset (2.5K Hypersim + 20K vKITTI)
 
 optimizer:
   name: Adam

@@ -74,7 +74,7 @@ class SlotAttention(nn.Module):
         self.norm2 = nn.LayerNorm(embed_dim)
         self.ffn = MLP(embed_dim, [ffn_dim, embed_dim], None, dropout)
 
-    def forward(self, input, query, smask=None, num_iter=None):
+    def forward(self, input, query, smask=None, input_mask=None,num_iter=None):
         """
         Args:
             input: Input features, shape (B, H*W, C)
@@ -93,6 +93,9 @@ class SlotAttention(nn.Module):
         kv = self.norm1kv(input)
         k = self.proj_k(kv)  # (B, H*W, C)
         v = self.proj_v(kv)  # (B, H*W, C)
+        if input_mask is not None:
+            v = v*input_mask.unsqueeze(-1)# 前面不是已经unsqueeze了吗？
+            k = k*input_mask.unsqueeze(-1)
 
         # Iterative slot attention
         slots = query
@@ -257,7 +260,7 @@ class SlotAggregator(nn.Module):
             trunc_bp=None,  # Can use "bi-level" for faster training
         )
 
-    def forward(self, feat):
+    def forward(self, feat,valid_mask=None):
         """
         Args:
             feat: Input features, shape (B, C, H, W) or (B, H*W, C)
@@ -271,11 +274,16 @@ class SlotAggregator(nn.Module):
             B, C, H, W = feat.shape
             feat = feat.flatten(2).permute(0, 2, 1)  # (B, H*W, C)
 
+        if valid_mask is not None:
+            valid_flat = valid_mask.flatten(1) # (B,H*W)
+            feat = feat * valid_flat.unsqueeze(-1) # mask padding -> zero vector
+        else:
+            valid_flat = None
         # Initialize slots
         queries = self.slot_init(feat)  # (B, num_slots, slot_dim)
 
         # Slot attention
-        slots, attn = self.slot_attn(feat, queries)  # (B, num_slots, slot_dim)
+        slots, attn = self.slot_attn(feat, queries,input_mask=valid_flat)  # (B, num_slots, slot_dim)
 
         return slots, attn
 

@@ -28,6 +28,7 @@
 # If you find Marigold useful, we kindly ask you to cite our papers.
 # --------------------------------------------------------------------------
 
+import torch.nn as nn
 import logging
 import numpy as np
 import os
@@ -45,7 +46,8 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from typing import List, Union
-
+from einops import rearrange
+import torch.nn.functional as F
 from marigold.marigold_depth_pipeline import MarigoldDepthPipeline, MarigoldDepthOutput
 from src.util import metric
 from src.util.alignment import align_depth_least_square
@@ -101,11 +103,15 @@ class MarigoldDepthTrainer:
         self.model.text_encoder.requires_grad_(False)
         self.model.unet.requires_grad_(True)
         self.model.aggregator.requires_grad_(True)
-
+        self.model.dino_encoder.requires_grad_(False)
+        self.slot_proj_norm = nn.LayerNorm(self.model.aggregator.slot_dim).to(device)
         # Optimizer !should be defined after input layer is adapted
         lr = self.cfg.lr
         self.optimizer = Adam(
-            list(self.model.unet.parameters()) + list(self.model.aggregator.parameters()),
+            list(self.model.unet.parameters()) 
+            + list(self.model.aggregator.parameters())
+            + list(self.model.broadcast_decoder.parameters())
+            + list(self.slot_proj_norm.parameters()),
             lr=lr
         )
 
@@ -119,7 +125,9 @@ class MarigoldDepthTrainer:
 
         # Loss
         self.loss = get_loss(loss_name=self.cfg.loss.name, **self.cfg.loss.kwargs)
-
+        # Reconstruction loss 参数
+        self.recon_warmup_steps = self.cfg.get("recon_warmup_steps",200)
+        self.lambda_recon = self.cfg.get("lambda_recon",0.1)
         # Training noise scheduler
         self.training_noise_scheduler: DDPMScheduler = DDPMScheduler.from_config(
             self.model.scheduler.config,
@@ -261,8 +269,8 @@ class MarigoldDepthTrainer:
                     # Encode image
                     rgb_latent = self.encode_rgb(rgb)  # [B, 4, h, w]
 
-                    # Extract VAE intermediate features (stored by hook during encode_rgb)
-                    vae_mid_feat = self.model.vae_mid_features  # [B, 512, h, w]
+                    # Dino encoder
+                    dino_feat,dino_valid_mask = self.model.dino_encoder(rgb) # [b,384,h_d,w_d]
 
                     # Encode GT depth
                     gt_target_latent = self.encode_depth(
@@ -308,21 +316,26 @@ class MarigoldDepthTrainer:
                 )  # [B, 8, h, w]
                 cat_latents = cat_latents.float()
 
-                # Concatenate VAE mid features with rgb_latent for slot aggregation
-                slot_input = torch.cat([vae_mid_feat, rgb_latent], dim=1)  # [B, 516, h, w]
-
                 # Aggregate slots (needs gradient)
-                slots, attn = self.model.aggregator(slot_input)  # (B, num_slots, slot_dim)
-
+                slots0, attn = self.model.aggregator(dino_feat,valid_mask = dino_valid_mask)  # (B, num_slots, slot_dim)
+                # 诊断
+                if torch.isnan(slots0).any():
+                    logging.warning(f"slots0 contains NaN! dino_feat nan: {torch.isnan(dino_feat).any()}")
+                if torch.isinf(slots0).any() or slots0.abs().max() > 1e4:
+                    logging.warning(f"slots0 exploded! max={slots0.abs().max().item():.2f}")
+                    
                 # Pad to 77 to match context dimension
-                B, num_slots, slot_dim = slots.shape
+                B, num_slots, slot_dim = slots0.shape
                 if num_slots < 77:
                     padding = torch.zeros(
                         B, 77 - num_slots, slot_dim,
-                        device=slots.device,
-                        dtype=slots.dtype
+                        device=slots0.device,
+                        dtype=slots0.dtype
                     )
-                    slots = torch.cat([slots, padding], dim=1)  # (B, 77, 1024)
+                    slots = torch.cat([slots0, padding], dim=1)  # (B, 77, 1024)
+
+                # Normalize slots before feeding to UNet
+                slots = self.slot_proj_norm(slots)
 
                 # Predict the noise residual
                 model_pred = self.model.unet(
@@ -349,15 +362,40 @@ class MarigoldDepthTrainer:
                         model_pred[valid_mask_down].float(),
                         target[valid_mask_down].float(),
                     )
+                    logging.warning(f"noise loss mask:{latent_loss.item()}")
                 else:
                     latent_loss = self.loss(model_pred.float(), target.float())
+                    logging.warning(f"noise loss:{latent_loss.item()}")
 
                 loss = latent_loss.mean()
+                # ===== 特征重建启用 loss (warmup 后启用)
+                if self.effective_iter>=self.recon_warmup_steps:
+                    _,_,dh,dw = dino_feat.shape
+                    dino_flat = rearrange(dino_feat,"b c h w -> b (h w) c")
+                    valid_flat = rearrange(dino_valid_mask,"b h w -> b (h w)")
+                    recon_feat,alpha2 = self.model.broadcast_decoder(
+                        slots0, spatial_h=dh, spatial_w=dw, valid_mask=valid_flat
+                    )
+                    # 只在有效区域上面计算loss,slots0不是padding的slots
+                    recon_feat_valid = recon_feat[valid_flat] # (total_valid,384)
+                    dino_valid = dino_flat[valid_flat] # (total_valid,384) 计算正确吗？
+                    recon_loss = F.mse_loss(recon_feat_valid,dino_valid)
+                    logging.warning(f"重构损失：{recon_loss.item()}")
+                    loss = loss+self.lambda_recon*recon_loss
 
                 self.train_metrics.update("loss", loss.item())
 
                 loss = loss / self.gradient_accumulation_steps
                 loss.backward()
+                # 诊断
+                for name, p in self.model.aggregator.named_parameters():
+                    if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                        logging.warning(f"NaN/Inf grad in aggregator.{name}, max={p.grad.abs().max().item()}")
+                        break
+                for name, p in self.model.broadcast_decoder.named_parameters():
+                    if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                        logging.warning(f"NaN/Inf grad in broadcast_decoder.{name}, max={p.grad.abs().max().item()}")
+                        break
                 accumulated_step += 1
 
                 self.n_batch_in_epoch += 1
@@ -366,7 +404,10 @@ class MarigoldDepthTrainer:
                 # Perform optimization step
                 if accumulated_step >= self.gradient_accumulation_steps:
                     torch.nn.utils.clip_grad_norm_(
-                        self.model.unet.parameters(), max_norm=1.0
+                        list(self.model.unet.parameters())+ list(self.model.aggregator.parameters())
+                        + list(self.model.broadcast_decoder.parameters())
+                        + list(self.slot_proj_norm.parameters()),
+                        max_norm=1.0
                     )
                     self.optimizer.step()
                     self.lr_scheduler.step()
@@ -379,8 +420,8 @@ class MarigoldDepthTrainer:
                     self._last_vis_data = {
                         "rgb": rgb.detach().cpu(),
                         "attn": attn.detach().cpu(),
-                        "latent_h": vae_mid_feat.shape[2],
-                        "latent_w": vae_mid_feat.shape[3],
+                        "latent_h": dino_feat.shape[2],
+                        "latent_w": dino_feat.shape[3],
                     }
 
                     # Log to tensorboard
