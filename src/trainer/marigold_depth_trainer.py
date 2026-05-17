@@ -157,7 +157,7 @@ class MarigoldDepthTrainer:
         # Eval metrics
         self.metric_funcs = [getattr(metric, _met) for _met in cfg.eval.eval_metrics]
 
-        self.train_metrics = MetricTracker(*["loss"])
+        self.train_metrics = MetricTracker(*["loss", "latent_loss", "recon_loss"])
         self.val_metrics = MetricTracker(*[m.__name__ for m in self.metric_funcs])
 
         # main metric for best checkpoint saving
@@ -319,10 +319,10 @@ class MarigoldDepthTrainer:
                 # Aggregate slots (needs gradient)
                 slots0, attn = self.model.aggregator(dino_feat,valid_mask = dino_valid_mask)  # (B, num_slots, slot_dim)
                 # 诊断
-                if torch.isnan(slots0).any():
-                    logging.warning(f"slots0 contains NaN! dino_feat nan: {torch.isnan(dino_feat).any()}")
-                if torch.isinf(slots0).any() or slots0.abs().max() > 1e4:
-                    logging.warning(f"slots0 exploded! max={slots0.abs().max().item():.2f}")
+                # if torch.isnan(slots0).any():
+                #     logging.warning(f"slots0 contains NaN! dino_feat nan: {torch.isnan(dino_feat).any()}")
+                # if torch.isinf(slots0).any() or slots0.abs().max() > 1e4:
+                #     logging.warning(f"slots0 exploded! max={slots0.abs().max().item():.2f}")
                     
                 # Pad to 77 to match context dimension
                 B, num_slots, slot_dim = slots0.shape
@@ -362,12 +362,13 @@ class MarigoldDepthTrainer:
                         model_pred[valid_mask_down].float(),
                         target[valid_mask_down].float(),
                     )
-                    logging.warning(f"noise loss mask:{latent_loss.item()}")
+                    # logging.warning(f"noise loss mask:{latent_loss.item()}")
                 else:
                     latent_loss = self.loss(model_pred.float(), target.float())
-                    logging.warning(f"noise loss:{latent_loss.item()}")
+                    # logging.warning(f"noise loss:{latent_loss.item()}")
 
                 loss = latent_loss.mean()
+                self.train_metrics.update("latent_loss", loss.item())   # 噪声损失（无 lambda 加权前）
                 # ===== 特征重建启用 loss (warmup 后启用)
                 if self.effective_iter>=self.recon_warmup_steps:
                     _,_,dh,dw = dino_feat.shape
@@ -380,7 +381,8 @@ class MarigoldDepthTrainer:
                     recon_feat_valid = recon_feat[valid_flat] # (total_valid,384)
                     dino_valid = dino_flat[valid_flat] # (total_valid,384) 计算正确吗？
                     recon_loss = F.mse_loss(recon_feat_valid,dino_valid)
-                    logging.warning(f"重构损失：{recon_loss.item()}")
+                    # logging.warning(f"重构损失：{recon_loss.item()}")
+                    self.train_metrics.update("recon_loss", recon_loss.item())
                     loss = loss+self.lambda_recon*recon_loss
 
                 self.train_metrics.update("loss", loss.item())
@@ -388,14 +390,15 @@ class MarigoldDepthTrainer:
                 loss = loss / self.gradient_accumulation_steps
                 loss.backward()
                 # 诊断
-                for name, p in self.model.aggregator.named_parameters():
-                    if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
-                        logging.warning(f"NaN/Inf grad in aggregator.{name}, max={p.grad.abs().max().item()}")
-                        break
-                for name, p in self.model.broadcast_decoder.named_parameters():
-                    if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
-                        logging.warning(f"NaN/Inf grad in broadcast_decoder.{name}, max={p.grad.abs().max().item()}")
-                        break
+                # for name, p in self.model.aggregator.named_parameters():
+                #     if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                #         logging.warning(f"NaN/Inf grad in aggregator.{name}, max={p.grad.abs().max().item()}")
+                #         break
+                # for name, p in self.model.broadcast_decoder.named_parameters():
+                #     if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                #         logging.warning(f"NaN/Inf grad in broadcast_decoder.{name}, max={p.grad.abs().max().item()}")
+                #         break
+
                 accumulated_step += 1
 
                 self.n_batch_in_epoch += 1
@@ -784,42 +787,58 @@ class MarigoldDepthTrainer:
         return
 
     def _log_slots_wandb(self, rgb, attn, latent_h, latent_w):
-        """Log original RGB and slots attention map (black background) to wandb."""
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        # Use first image in batch
-        img = rgb[0]  # (3, H, W)
+        img = rgb[0]
         H, W = img.shape[1], img.shape[2]
-        img_np = ((img.permute(1, 2, 0).numpy() + 1) / 2).clip(0, 1)  # (H, W, 3)
+        img_np = ((img.permute(1, 2, 0).cpu().numpy() + 1) / 2).clip(0, 1)
+        img_u8 = (img_np * 255).astype(np.uint8)
 
         num_slots = attn.shape[1]
-        attn_hw = attn[0]  # (num_slots, H*W)
+        # attn: (B, num_slots, H*W), softmax over slots → each pixel sums to 1
+        attn_hw = attn[0].reshape(num_slots, latent_h, latent_w).cpu().numpy()
 
-        # Use actual latent spatial dimensions (non-square support)
-        attn_hw = attn_hw.reshape(num_slots, latent_h, latent_w).numpy()
+        # --- argmax segmentation map (VQ-style) ---
+        attn_full = np.stack([
+            np.array(Image.fromarray(attn_hw[s]).resize((W, H), Image.BILINEAR))
+            for s in range(num_slots)
+        ])  # (num_slots, H, W)
+        seg_idx = attn_full.argmax(axis=0)  # (H, W) each pixel → slot id
 
-        colors = plt.cm.get_cmap("tab20", num_slots)
+        np.random.seed(42)
+        colors = np.random.randint(60, 230, size=(num_slots, 3), dtype=np.uint8)
+        colors[0] = [40, 40, 40]  # slot 0 = dark (background)
 
-        # Slots attention on black background
-        slot_map = np.zeros((H, W, 3), dtype=np.float32)
+        seg_color = colors[seg_idx]  # (H, W, 3)
+        overlay = (img_u8 * 0.5 + seg_color * 0.5).astype(np.uint8)
+
+        cols = max(3, num_slots)
+        fig, axes = plt.subplots(2, cols, figsize=(cols * 3, 8))
+
+        axes[0, 0].imshow(img_np);    axes[0, 0].set_title("RGB");      axes[0, 0].axis("off")
+        axes[0, 1].imshow(seg_color); axes[0, 1].set_title("Slot seg"); axes[0, 1].axis("off")
+        axes[0, 2].imshow(overlay);   axes[0, 2].set_title("Overlay");  axes[0, 2].axis("off")
+        for i in range(3, cols):
+            axes[0, i].axis("off")
+
+        # Row 2: per-slot binary mask applied to RGB
         for s in range(num_slots):
-            a = attn_hw[s]  # (lh, lw)
-            a = np.array(Image.fromarray(a).resize((W, H), Image.BILINEAR))
-            a = (a - a.min()) / (a.max() - a.min() + 1e-6)
-            color = np.array(colors(s)[:3])
-            slot_map += a[:, :, None] * color
+            mask = (seg_idx == s)
+            masked = img_u8.copy()
+            masked[~mask] = 0
+            ax = axes[1, s] if s < cols else None
+            if ax is not None:
+                ax.imshow(masked)
+                ax.set_title(f"slot {s}")
+                ax.axis("off")
+        for i in range(num_slots, cols):
+            axes[1, i].axis("off")
 
-        slot_map = slot_map.clip(0, 1)
-
-        wandb.log(
-            {
-                "train/rgb": wandb.Image((img_np * 255).astype(np.uint8)),
-                "train/slots_attn": wandb.Image((slot_map * 255).astype(np.uint8)),
-            },
-            step=self.effective_iter,
-        )
+        fig.tight_layout()
+        wandb.log({"train/slots_grid": wandb.Image(fig)}, step=self.effective_iter)
+        plt.close(fig)
 
     def _get_backup_ckpt_name(self):
         return f"iter_{self.effective_iter:06d}"

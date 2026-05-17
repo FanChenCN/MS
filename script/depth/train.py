@@ -121,6 +121,12 @@ if "__main__" == __name__:
         action="store_true",
         help="Add datetime to the output folder name.",
     )
+    parser.add_argument(
+    "--run_name",
+    type=str,
+    default=None,
+    help="Custom run name shown in wandb and used as output folder name.",
+)
 
     args = parser.parse_args()
     resume_run = args.resume_run
@@ -141,7 +147,14 @@ if "__main__" == __name__:
     if resume_run is not None:
         logging.info(f"Resuming run: {resume_run}")
         out_dir_run = os.path.dirname(os.path.dirname(resume_run))
-        job_name = os.path.basename(out_dir_run)
+        pure_job_name = os.path.basename(args.config).split(".")[0]
+        if args.run_name is not None:
+            job_name = args.run_name
+        elif args.add_datetime_prefix:
+            job_name = f"{t_start.strftime('%y_%m_%d-%H_%M_%S')}-{pure_job_name}"
+        else:
+            job_name = pure_job_name
+        # job_name = os.path.basename(out_dir_run)
         # Resume config file
         cfg = OmegaConf.load(os.path.join(out_dir_run, "config.yaml"))
     else:
