@@ -20,6 +20,7 @@
 *.mexa64
 *.pdf
 *.tar
+/CLAUDE.md
 
 # ignore files and dirs with temp in the name
 *temp*
